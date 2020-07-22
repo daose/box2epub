@@ -37,23 +37,22 @@ lazy_static! {
 /// EPUB only accepts xhtml, so this converts html to xhtml (i.e. <br> to <br />)
 /// Turns out `prettier` formatting does a pretty good job of this so let's just
 /// use this (slow) heavy-handed solution for now.
-///
-/// TODO: change from std process to tokio async process
-fn sanitize_html(html: String) -> String {
-    use std::process::{Command, Stdio};
-
+async fn sanitize_html(html: String) -> String {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
     let mut prettier_cmd = Command::new("npx")
         .args(vec!["prettier", "--parser", "html"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("Couldn't start npx");
     {
         let stdin = prettier_cmd.stdin.as_mut().unwrap();
-        stdin.write_all(html.as_bytes()).unwrap();
+        stdin.write_all(html.as_bytes()).await.unwrap();
     }
 
-    String::from_utf8(prettier_cmd.wait_with_output().unwrap().stdout)
+    String::from_utf8(prettier_cmd.wait_with_output().await.unwrap().stdout)
         .unwrap()
         // TODO: handle html entity conversion properly
         .replace("&nbsp;", "&#160;")
@@ -143,7 +142,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         let url = url.clone();
         tokio::spawn(async move {
             println!("Downloading {}", url);
-            http_client.get(&url).send().await?.text().await
+            let chapter_html = http_client
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let mut chapter = extract_chapter(&chapter_html);
+            chapter.content = sanitize_html(chapter.content).await;
+            future::ready(chapter).await
         })
     }))
     .buffered(std::cmp::min(MAX_PARALLEL, num_cpus::get()));
@@ -174,17 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     download_tasks
         .enumerate()
         .for_each(|(i, task)| {
-            let chapter_html = task.unwrap().unwrap();
-            let chapter = extract_chapter(&chapter_html);
-            let chapter_body = sanitize_html(chapter.content);
+            let chapter = task.unwrap();
             let content = {
                 if i == 0 {
-                    EpubContent::new(&format!("c{}.xhtml", i), chapter_body.as_bytes())
+                    EpubContent::new(&format!("c{}.xhtml", i), chapter.content.as_bytes())
                         .title(chapter.title)
                         // First chapter requires reftype to be set
                         .reftype(ReferenceType::Text)
                 } else {
-                    EpubContent::new(&format!("c{}.xhtml", i), chapter_body.as_bytes())
+                    EpubContent::new(&format!("c{}.xhtml", i), chapter.content.as_bytes())
                         .title(chapter.title)
                 }
             };
