@@ -1,8 +1,7 @@
+use box2epub::extractor::BoxnExtractor;
+use box2epub::extractor::Extractor;
 use futures::future;
 use futures::stream::{self, StreamExt};
-use regex::Regex;
-use regex::RegexBuilder;
-use std::io::Write;
 
 use epub_builder::EpubBuilder;
 use epub_builder::EpubContent;
@@ -11,28 +10,6 @@ use epub_builder::ZipLibrary;
 
 // Don't overwhelm the server with too many connections at once
 const MAX_PARALLEL: usize = 8;
-
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static! {
-    // TODO: regex breaks if more classes are added
-    static ref HOME_TITLE_REGEX: Regex =
-        RegexBuilder::new(r#"<ol class="breadcrumb">.*<li>.*?<a.*?>(.+?)</a>.*?</li>.*?</ol>"#)
-            .dot_matches_new_line(true)
-            .build()
-            .unwrap();
-    static ref HOME_AUTHOR_REGEX: Regex =
-        RegexBuilder::new(r#"<div.+?class="author-content".*?>.*?<a.*?>(.+?)</a>"#)
-            .dot_matches_new_line(true)
-            .build()
-            .unwrap();
-    static ref HOME_IMAGE_REGEX: Regex =
-        RegexBuilder::new(r#"<div.+?class="summary_image">.*?src="(.+?)".*?</div>"#)
-            .dot_matches_new_line(true)
-            .build()
-            .unwrap();
-}
 
 /// EPUB only accepts xhtml, so this converts html to xhtml (i.e. <br> to <br />)
 /// Turns out `prettier` formatting does a pretty good job of this so let's just
@@ -45,6 +22,7 @@ async fn sanitize_html(html: String) -> String {
         .args(vec!["prettier", "--parser", "html"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Couldn't start npx");
     {
@@ -56,46 +34,6 @@ async fn sanitize_html(html: String) -> String {
         .unwrap()
         // TODO: handle html entity conversion properly
         .replace("&nbsp;", "&#160;")
-}
-
-use scraper::Selector;
-lazy_static! {
-    static ref TITLE_SELECTOR: Selector = Selector::parse("title").unwrap();
-    static ref CONTENT_SELECTOR: Selector = Selector::parse("div.text-left").unwrap();
-}
-
-struct Chapter {
-    title: String,
-    content: String,
-}
-
-fn extract_chapter(html: &str) -> Chapter {
-    let document = scraper::Html::parse_document(html);
-    let title_element = document
-        .select(&TITLE_SELECTOR)
-        .next()
-        .expect("No <title> found");
-    let title: String = title_element.text().collect();
-
-    let content_element = document
-        .select(&CONTENT_SELECTOR)
-        .next()
-        .expect("No chapter content found");
-
-    let content = format!(
-        r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-    <head>
-        <title>{}</title>
-    </head>
-    <body>
-        {}
-    </body>
-</html>"#,
-        title,
-        content_element.inner_html()
-    );
-
-    Chapter { title, content }
 }
 
 #[tokio::main]
@@ -118,28 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let http_client = reqwest::Client::new();
     let home_html = http_client.get(&site).send().await?.text().await?;
 
-    let title = HOME_TITLE_REGEX
-        .captures(&home_html)
-        .map_or("box2epub", |capture| capture.get(1).unwrap().as_str())
-        .trim();
-    let author = HOME_AUTHOR_REGEX
-        .captures(&home_html)
-        .map_or("box2epub", |capture| capture.get(1).unwrap().as_str())
-        .trim();
-    let image_url_opt = HOME_IMAGE_REGEX
-        .captures(&home_html)
-        .map(|capture| capture.get(1).unwrap().as_str().trim());
+    let extractor = BoxnExtractor::new(&site);
+    let overview = extractor.extract_overview(&home_html);
 
-    let chapter_url_regex = Regex::new(&format!(r#"<a.+?href="({}.+?)".*?>"#, site)).unwrap();
-    let chapter_urls: Vec<String> = chapter_url_regex
-        .captures_iter(&home_html)
-        .map(|capture| capture.get(1).unwrap().as_str().to_string())
-        .collect();
-
-    // Use rev to reverse since chapter_urls are captured in latest->oldest order
-    let download_tasks = stream::iter(chapter_urls.iter().rev().map(|url| {
+    let download_tasks = stream::iter(overview.download_urls.iter().map(|url| {
         let http_client = http_client.clone();
         let url = url.clone();
+        let extractor = extractor.clone();
         tokio::spawn(async move {
             println!("Downloading {}", url);
             let chapter_html = http_client
@@ -150,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
                 .text()
                 .await
                 .unwrap();
-            let mut chapter = extract_chapter(&chapter_html);
+            let mut chapter = extractor.extract_chapter(&chapter_html);
             chapter.content = sanitize_html(chapter.content).await;
             future::ready(chapter).await
         })
@@ -158,10 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     .buffered(std::cmp::min(MAX_PARALLEL, num_cpus::get()));
 
     let mut builder = EpubBuilder::new(ZipLibrary::new()?)?;
-    builder.metadata("author", author)?;
-    builder.metadata("title", title)?;
-    if let Some(image_url) = image_url_opt {
-        let resp = http_client.get(image_url).send().await?;
+    builder.metadata("author", overview.author)?;
+    builder.metadata("title", overview.title)?;
+    if let Some(image_url) = overview.img_url {
+        let resp = http_client.get(&image_url).send().await?;
         let mimetype_opt = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -207,17 +130,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
     Ok(())
 }
-
-/*
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test() {
-        let chapter_html = std::fs::read_to_string("./assets/chapter.html").unwrap();
-        println!("{}", sanitize_html(chapter_html));
-        assert!(false);
-    }
-}
-*/
