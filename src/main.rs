@@ -1,5 +1,6 @@
-use box2epub::extractor::BoxnExtractor;
 use box2epub::extractor::Extractor;
+use box2epub::extractor::{BoxnExtractor, RwnExtractor};
+
 use futures::future;
 use futures::stream::{self, StreamExt};
 
@@ -10,6 +11,7 @@ use epub_builder::ZipLibrary;
 
 // Don't overwhelm the server with too many connections at once
 const MAX_PARALLEL: usize = 8;
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 5.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36";
 
 /// EPUB only accepts xhtml, so this converts html to xhtml (i.e. <br> to <br />)
 /// Turns out `prettier` formatting does a pretty good job of this so let's just
@@ -34,15 +36,14 @@ async fn sanitize_html(html: String) -> String {
         .unwrap()
         // TODO: handle html entity conversion properly
         .replace("&nbsp;", "&#160;")
+        .replace(char::is_control, "")
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     // Normalize the site to have slash at the end
     let site = {
-        let raw_site = std::env::args()
-            .nth(1)
-            .expect("One argument to be provided");
+        let raw_site = std::env::args().nth(1).expect("Url argument missing");
         let last_char = raw_site
             .chars()
             .last()
@@ -53,10 +54,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
             raw_site + "/"
         }
     };
-    let http_client = reqwest::Client::new();
-    let home_html = http_client.get(&site).send().await?.text().await?;
 
-    let extractor = BoxnExtractor::new(&site);
+    let extractor_num = std::env::args().nth(2).expect("Extractor argument missing");
+
+    if extractor_num == "1" {
+        run(BoxnExtractor::new(site.as_str()), site.as_str()).await
+    } else if extractor_num == "2" {
+        run(RwnExtractor::new(site.as_str()), site.as_str()).await
+    } else {
+        panic!("No extractor exists")
+    }
+}
+
+async fn run(
+    extractor: impl Extractor + Send + Sync + Clone + 'static,
+    site: &str,
+) -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let http_client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+    let home_html = http_client.get(site).send().await?.text().await?;
     let overview = extractor.extract_overview(&home_html);
 
     let download_tasks = stream::iter(overview.download_urls.iter().map(|url| {

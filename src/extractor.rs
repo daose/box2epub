@@ -1,6 +1,10 @@
 mod boxn;
 pub use boxn::BoxnExtractor;
 
+mod rwn;
+pub use rwn::RwnExtractor;
+
+#[derive(Debug)]
 pub struct Overview {
     pub title: String,
     pub author: String,
@@ -8,6 +12,7 @@ pub struct Overview {
     pub download_urls: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct Chapter {
     pub title: String,
     pub content: String,
